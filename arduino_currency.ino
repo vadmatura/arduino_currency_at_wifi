@@ -2,7 +2,10 @@
 
 #include <SoftwareSerial.h>
 
+#define SERIAL_BIT_RATE 9600
+
 SoftwareSerial esp8266(2, 3);
+
 class CommandManager {
 #define CM_SHIFT_COMMAND_BUFFER_SIZE 16
 #define CM_SHIFT_COMMAND_BUFFER_LAST (CM_SHIFT_COMMAND_BUFFER_SIZE - 1)
@@ -27,8 +30,8 @@ public:
 
   void process() {
     if (esp8266.available()) {
-      char c = esp8266.read();
-      Serial.write(c);
+      char responceChar = esp8266.read();
+      Serial.write(responceChar);
       char* headPos;
       String dataLen;
       if (!m_finishedWork) {
@@ -40,7 +43,7 @@ public:
             changeWorkMode(WorkMode::dataHead);
           }
         } else {
-          addToShiftCommandBuffer(c);
+          addToShiftCommandBuffer(responceChar);
           AtResult respondResult = checkResult();
           switch (respondResult) {
           case AtResult::ok_rst:
@@ -224,7 +227,7 @@ const char* request = "GET /export/exchange_rate_cash.json HTTP/1.1\r\nHost: ban
 
 void setup() {
   // Open serial communications and wait for port to open:
-  Serial.begin(9600);
+  Serial.begin(SERIAL_BIT_RATE);
   while (!Serial) {
     ; // wait for serial port to connect. Needed for native USB port only
   }
@@ -232,7 +235,8 @@ void setup() {
   Serial.println("Started");
 
   // set the data rate for the SoftwareSerial port
-  esp8266.begin(9600);
+  esp8266.begin(SERIAL_BIT_RATE);
+  // TODO: delete temporary command for reset after bad command using.
   esp8266.write("AT+CIPCLOSE\r\n----------------------------------------------\r\n");
   cm.start(0,8);
 }
