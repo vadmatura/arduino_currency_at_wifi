@@ -3,8 +3,51 @@
 #include <SoftwareSerial.h>
 
 #define SERIAL_BIT_RATE 9600
+typedef void (*DataCompleteFunc)(const char* dataStr);
+typedef void (*CommandsCompleteFunc)(uint8_t commandNum);
 
 SoftwareSerial esp8266(2, 3);
+
+class DataManager {
+#define DM_DATA_BUFFER_SIZE 256
+public:
+  DataManager(DataCompleteFunc func) {
+    m_workMode = WorkMode::none;
+    m_dataCompleteFunc = func;
+  }
+  
+  void add(const char dataChar) {
+    if (m_workMode == WorkMode::data) {  // write to buffer
+      if ((m_dataBufferPos - m_dataBuffer) < DM_DATA_BUFFER_SIZE) {
+        *m_dataBufferPos = dataChar;
+        m_dataBufferPos++;
+      } else {  //overbuffer
+        m_workMode = WorkMode::none;
+      }
+    }
+
+    if (dataChar == '{') {  // start write to buffer
+      m_dataBufferPos = m_dataBuffer;
+      m_workMode = WorkMode::data;
+    }
+    if (dataChar == '}') {  // end write to buffer
+      m_dataBufferPos--;
+      *m_dataBufferPos = '\0';
+      m_workMode = WorkMode::none;
+      //call result func
+      m_dataCompleteFunc(m_dataBuffer);
+    }    
+  }
+  
+protected:
+  enum WorkMode {none, data};
+  char m_dataBuffer[DM_DATA_BUFFER_SIZE + 1];
+  
+private:
+  char* m_dataBufferPos;
+  WorkMode m_workMode;
+  DataCompleteFunc m_dataCompleteFunc;
+};
 
 class CommandManager {
 #define CM_SHIFT_COMMAND_BUFFER_SIZE 16
@@ -12,12 +55,13 @@ class CommandManager {
 #define CM_TIMEOUT_MSEC 10000
 #define CM_DATA_WAIT_MSEC 2000
 public:
-  CommandManager(const char** commandArray) {
+  CommandManager(const char** commandArray, DataCompleteFunc dFunc, CommandsCompleteFunc cFunc) : m_dataManager(dFunc) {
     m_commandArray = commandArray;
     m_finishedWork = true;
     m_dataCounter = 0;
     m_shiftCommandBuffer[CM_SHIFT_COMMAND_BUFFER_SIZE] = 0;
     m_msecTimeWork = 0;
+    m_commandsCompleteFunc = cFunc;
   }
   
   void start(uint8_t startCommandForCall, uint8_t countForCall) {
@@ -37,6 +81,8 @@ public:
       if (!m_finishedWork) {
         if (m_workMode == WorkMode::data) { //read data
           //process data here
+          m_dataManager.add(responceChar);
+          
           m_dataCounter--;
           if (m_dataCounter == 0) {
             Serial.print("\r\n----DATA----");
@@ -58,7 +104,6 @@ public:
             if ( headPos != NULL) {
               dataLen = String(headPos + 5);
               m_dataCounter = dataLen.toInt();
-              //m_msecTimeWork = millis();
               Serial.print("\r\n----HEAD----");
               Serial.println(m_dataCounter);
               changeWorkMode(WorkMode::data);
@@ -78,7 +123,7 @@ public:
             break;
           default:
             Serial.println("\r\n----END----");
-            m_finishedWork = true;
+            finishWork(true);
           }
         }
       }
@@ -139,7 +184,7 @@ protected:
       m_msecTimeWork = millis();
       changeWorkMode(WorkMode::command);
     } else {
-      m_finishedWork = true;
+      finishWork(false);
     }
   }
 
@@ -153,7 +198,7 @@ protected:
     m_callRepeatCount++;
     if (m_callRepeatCount > 3) {
       Serial.println("\r\n----END----");
-      m_finishedWork = true;
+      finishWork(true);
     } else {
       call();
     }
@@ -177,7 +222,7 @@ protected:
       }
       if ((millis() - m_msecTimeWork) > CM_TIMEOUT_MSEC) {
         Serial.println("\r\n----TIMEOUT----");
-        m_finishedWork = true;
+        finishWork(true);
         m_msecTimeWork = millis();
       }
     }
@@ -191,6 +236,15 @@ protected:
       }
     }
   }
+
+  void finishWork(bool error) {
+    m_finishedWork = true;
+    if (error) {
+      m_commandsCompleteFunc(0);
+    } else {
+      m_commandsCompleteFunc(m_numCommandForCall);
+    }
+  }
   
 private:
   const char** m_commandArray;
@@ -200,6 +254,8 @@ private:
   uint16_t m_dataCounter;
   unsigned long m_msecTimeWork;
   WorkMode m_workMode;
+  DataManager m_dataManager;
+  CommandsCompleteFunc m_commandsCompleteFunc;
 };
 
 const char* commands[] = {"AT", 
@@ -221,7 +277,17 @@ const char* commands[] = {"AT",
                           "AT", 
                           "AT"};
 
-CommandManager cm(commands);
+void dataCompleteFunc(const char* dataStr) {
+  Serial.println("\r\n\r\nFIND DATA!!!");
+  Serial.println(dataStr);
+}
+
+void commandsCompleteFunc(uint8_t commandNum) {
+  Serial.println("\r\n\r\nEND COMMANDS!!!");
+  Serial.println(commandNum);
+}
+
+CommandManager cm(commands, &dataCompleteFunc, &commandsCompleteFunc);
 
 const char* request = "GET /export/exchange_rate_cash.json HTTP/1.1\r\nHost: bank-ua.com\r\n";
 
