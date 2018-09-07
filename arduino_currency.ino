@@ -3,8 +3,8 @@
 #include <SoftwareSerial.h>
 
 #define SERIAL_BIT_RATE 9600
-typedef void (*DataCompleteFunc)(const char* dataStr);
-typedef void (*CommandsCompleteFunc)(uint8_t commandNum);
+typedef void (*DataCompleteFunc)(char* dataStr);
+typedef void (*CommandsCompleteFunc)(uint8_t commandNum, bool error);
 
 SoftwareSerial esp8266(2, 3);
 
@@ -23,6 +23,7 @@ public:
         m_dataBufferPos++;
       } else {  //overbuffer
         m_workMode = WorkMode::none;
+        return;
       }
     }
 
@@ -41,7 +42,7 @@ public:
   
 protected:
   enum WorkMode {none, data};
-  char m_dataBuffer[DM_DATA_BUFFER_SIZE + 1];
+  char m_dataBuffer[DM_DATA_BUFFER_SIZE];
   
 private:
   char* m_dataBufferPos;
@@ -239,11 +240,7 @@ protected:
 
   void finishWork(bool error) {
     m_finishedWork = true;
-    if (error) {
-      m_commandsCompleteFunc(0);
-    } else {
-      m_commandsCompleteFunc(m_numCommandForCall);
-    }
+    m_commandsCompleteFunc(m_numCommandForCall, error);
   }
   
 private:
@@ -261,7 +258,7 @@ private:
 const char* commands[] = {"AT", 
                           /*"AT+RST", 
                           "AT+CWMODE_CUR=1", 
-                          "AT+CWJAP_CUR=\"****\",\"****\"", */
+                          "AT+CWJAP_CUR=\"****\",\"****\"", //*/
                           "AT+CIPSTART=\"TCP\",\"194.28.174.234\",80", 
                           "AT+CIPSEND=67", //71 - 4
                           "GET /export/exchange_rate_cash.json HTTP/1.1\r\nHost: bank-ua.com\r\n", 
@@ -277,14 +274,15 @@ const char* commands[] = {"AT",
                           "AT", 
                           "AT"};
 
-void dataCompleteFunc(const char* dataStr) {
+void dataCompleteFunc(char* dataStr) {
   Serial.println("\r\n\r\nFIND DATA!!!");
   Serial.println(dataStr);
 }
 
-void commandsCompleteFunc(uint8_t commandNum) {
+void commandsCompleteFunc(uint8_t commandNum, bool error) {
   Serial.println("\r\n\r\nEND COMMANDS!!!");
   Serial.println(commandNum);
+  Serial.println(error?"error":"ok");
 }
 
 CommandManager cm(commands, &dataCompleteFunc, &commandsCompleteFunc);
