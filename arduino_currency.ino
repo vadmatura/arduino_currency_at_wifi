@@ -4,8 +4,8 @@
 
 #define SERIAL_BIT_RATE 9600
 typedef void (*DataCompleteFunc)(char* dataStr);
-typedef void (*CommandResultFunc)(uint8_t commandNum, char* commandStr);
-typedef void (*CommandsCompleteFunc)(uint8_t commandNum, bool error);
+typedef void (*CommandResultFunc)(uint8_t commandNum, const char** commandArray, char* commandResponce);
+typedef void (*CommandsCompleteFunc)(uint8_t commandNum, const char** commandArray, bool error);
 
 SoftwareSerial esp8266(2, 3);
 
@@ -57,19 +57,19 @@ class CommandManager {
 #define CM_TIMEOUT_MSEC 10000
 #define CM_DATA_WAIT_MSEC 2500
 public:
-  CommandManager(const char** commandArray, DataCompleteFunc dFunc, CommandResultFunc crFunc, CommandsCompleteFunc cFunc) : 
+  CommandManager(DataCompleteFunc dFunc, CommandResultFunc crFunc, CommandsCompleteFunc cFunc) : 
                 m_dataManager(dFunc), 
                 m_commandBufferLast(m_commandBuffer + CM_COMMAND_BUFFER_LAST) {
-    m_commandArray = commandArray;
     m_finishedWork = true;
     m_dataCounter = 0;
     m_commandResultFunc = crFunc;
     m_commandsCompleteFunc = cFunc;
   }
   
-  void start(uint8_t startCommandForCall, uint8_t countForCall) {
-    m_numCommandForCall = startCommandForCall;
-    m_countForCall = countForCall;
+  void call(const char** commandArray) {
+    m_commandArray = commandArray;
+    m_numCommandForCall = 1;  // because 0 - is array size
+    m_countForCall = (int)(*m_commandArray);
     m_finishedWork = false;
     m_callRepeatCount = 0;
     call();
@@ -247,14 +247,14 @@ protected:
 
   void checkForNewCommandLine() {
     if (*(m_commandBufferPos - 1) == '\n') {      //new command line
-      m_commandResultFunc(m_numCommandForCall, m_commandBuffer);
+      m_commandResultFunc(m_numCommandForCall, m_commandArray, m_commandBuffer);
       changeWorkMode(m_workMode);
     }
   }
 
   void finishWork(bool error) {
     m_finishedWork = true;
-    m_commandsCompleteFunc(m_numCommandForCall, error);
+    m_commandsCompleteFunc(m_numCommandForCall, m_commandArray, error);
   }
   
 private:
@@ -274,28 +274,34 @@ private:
 //***********************************************************************************************
 //***********************************************************************************************
 
-const char* commands[] = {"AT", 
-                          "AT+CWMODE_CUR=1", 
-                          "AT+CIPSTA_CUR?", 
-                          "AT+CWJAP_CUR=\"SS-GUEST\",\"Welcome!\"", 
-                          //"AT+RST", 
-                          "AT+CIPSTART=\"TCP\",\"194.28.174.234\",80", 
-                          "AT+CIPSEND=67", 
-                          "GET /export/exchange_rate_cash.json HTTP/1.1\r\nHost: bank-ua.com\r\n", 
-                          "AT+CIPCLOSE", 
-                          "AT", 
-                          "AT", 
-                          "AT", 
-                          "AT", 
-                          "AT", 
-                          "AT", 
-                          "AT", 
-                          "AT", 
-                          "AT", 
-                          "AT"};
+//"AT+RST" 
+
+const char* commandsStart[] = {(char*)4,
+  "AT", 
+  "AT+CWMODE_CUR=1", 
+  "AT+CIPSTA_CUR?", 
+  "AT+CIPSTATUS"
+};
+
+const char* commandsConnectToWifi[] = {(char*)2,
+  "AT+CWJAP_CUR=\"*\",\"*\"",
+  "AT+CIPSTA_CUR?"
+};
+
+const char* commandsCloseTCP[] = {(char*)1,
+  "AT+CIPCLOSE"
+};
+
+const char* commandsGetData[] = {(char*)4,
+  "AT+CIPSTART=\"TCP\",\"194.28.174.234\",80", 
+  "AT+CIPSEND=67", 
+  "GET /export/exchange_rate_cash.json HTTP/1.1\r\nHost: bank-ua.com\r\n", 
+  "AT+CIPCLOSE"
+};
 
 bool isConnectedToWiFi = false;
-CommandManager cm(commands, &dataCompleteFunc, &commandResultFunc, &commandsCompleteFunc);
+bool isConnectedToTCP = false;
+CommandManager cm(&dataCompleteFunc, &commandResultFunc, &commandsCompleteFunc);
 
 #define MAX_FLOAT_STR_LENGTH 12
 
@@ -328,36 +334,48 @@ void dataCompleteFunc(char* dataStr) {
   }
 }
 
-void commandResultFunc(uint8_t commandNum, char* commandStr) {
+void commandResultFunc(uint8_t commandNum, const char** commandArray, char* commandResponce) {
   /*Serial.print("\r\nCOMMAND: ");
   Serial.print(commandNum);
   Serial.print(" ");
   Serial.println(commandStr);*/
-  if (commandNum == 2 && ((strstr(commandStr, "+CIPSTA_CUR:ip:\"") != NULL))) {
-    if (strstr(commandStr, "\"0.0.0.0\"") == NULL) {
-      isConnectedToWiFi = true;
-      Serial.println("ConnectedToWiFi");
+  if (strcmp("AT+CIPSTA_CUR?", commandArray[commandNum]) == 0) {
+    if (strstr(commandResponce, "+CIPSTA_CUR:ip:\"") != NULL) {
+      if (strstr(commandResponce, "\"0.0.0.0\"") == NULL) {
+        isConnectedToWiFi = true;
+        Serial.println("ConnectedToWiFi");
+      } else {
+        isConnectedToWiFi = false;
+      }
+    }
+  } else if (strcmp("AT+CIPSTATUS", commandArray[commandNum]) == 0) {
+    if (strstr(commandResponce, "STATUS:3") != NULL) {
+      isConnectedToTCP = true;
+        Serial.println("ConnectedToTCP");
     } else {
-      isConnectedToWiFi = false;
+      isConnectedToTCP = false;
     }
   }
 }
 
-void commandsCompleteFunc(uint8_t commandNum, bool error) {
+void commandsCompleteFunc(uint8_t commandNum, const char** commandArray, bool error) {
   /*Serial.print("\r\n\r\nEND COMMANDS: ");
   Serial.print(commandNum);
   Serial.println(error?" error":" ok");*/
   if (!error) {
-    switch(commandNum) {
-      case 3:
-      case 4:
+    if (commandArray == commandsStart || commandArray == commandsConnectToWifi || commandArray == commandsCloseTCP) {
+      if (isConnectedToTCP) {
+        cm.call(commandsCloseTCP);
+      } else {
         if (isConnectedToWiFi) {
-          cm.start(4,4);
+          cm.call(commandsGetData);
         } else {
-          cm.start(3,1);
+          cm.call(commandsConnectToWifi);
         }
-        break;
+      }
     }
+  } else {
+    //cm.call(commandsStart);
   }
 }
 
@@ -376,7 +394,7 @@ void setup() {
   esp8266.begin(SERIAL_BIT_RATE);
   // TODO: delete temporary command for reset after bad command using.
   //esp8266.write("AT+CIPCLOSE\r\n----------------------------------------------\r\n");
-  cm.start(0,3);
+  cm.call(commandsStart);
 }
 
 void loop() {
