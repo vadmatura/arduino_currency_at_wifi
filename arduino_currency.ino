@@ -2,11 +2,16 @@
 
 #include <SoftwareSerial.h>
 
-#define SERIAL_BIT_RATE 9600
-typedef void (*DataCompleteFunc)(char* dataStr);
-typedef void (*CommandsCompleteFunc)(uint8_t commandNum, bool error);
+#define DEBUG_SERIAL
 
-SoftwareSerial esp8266(2, 3);
+typedef void (*DataCompleteFunc)(char* dataStr);
+typedef void (*CommandResultFunc)(uint8_t commandNum, const char** commandArray, char* commandResponse);
+typedef void (*CommandsCompleteFunc)(uint8_t commandNum, const char** commandArray, bool error);
+
+const byte rxPin = 2;
+const byte txPin = 3;
+
+SoftwareSerial esp8266(rxPin, txPin);
 
 class DataManager {
 #define DM_DATA_BUFFER_SIZE 256
@@ -51,46 +56,49 @@ private:
 };
 
 class CommandManager {
-#define CM_SHIFT_COMMAND_BUFFER_SIZE 16
-#define CM_SHIFT_COMMAND_BUFFER_LAST (CM_SHIFT_COMMAND_BUFFER_SIZE - 1)
+#define CM_COMMAND_BUFFER_SIZE 64
+#define CM_COMMAND_BUFFER_LAST (CM_COMMAND_BUFFER_SIZE - 1)
 #define CM_TIMEOUT_MSEC 10000
-#define CM_DATA_WAIT_MSEC 2000
+#define CM_DATA_WAIT_MSEC 2500
 public:
-  CommandManager(const char** commandArray, DataCompleteFunc dFunc, CommandsCompleteFunc cFunc) : m_dataManager(dFunc) {
-    m_commandArray = commandArray;
+  CommandManager(DataCompleteFunc dFunc, CommandResultFunc crFunc, CommandsCompleteFunc cFunc) : 
+                m_dataManager(dFunc), 
+                m_commandBufferLast(m_commandBuffer + CM_COMMAND_BUFFER_LAST) {
     m_finishedWork = true;
     m_dataCounter = 0;
-    m_shiftCommandBuffer[CM_SHIFT_COMMAND_BUFFER_SIZE] = 0;
-    m_msecTimeWork = 0;
+    m_commandResultFunc = crFunc;
     m_commandsCompleteFunc = cFunc;
   }
   
-  void start(uint8_t startCommandForCall, uint8_t countForCall) {
-    m_numCommandForCall = startCommandForCall;
-    m_countForCall = countForCall;
+  void call(const char** commandArray) {
+    m_commandArray = commandArray;
+    m_numCommandForCall = 1;  // because 0 - is array size
+    m_countForCall = (int)(*m_commandArray);
     m_finishedWork = false;
     m_callRepeatCount = 0;
     call();
   }
 
   void process() {
+    const char* dataHeadSignature = "+IPD,";
     if (esp8266.available()) {
-      char responceChar = esp8266.read();
-      Serial.write(responceChar);
+      char responseChar = esp8266.read();
+      Serial.write(responseChar);
       char* headPos;
       String dataLen;
       if (!m_finishedWork) {
         if (m_workMode == WorkMode::data) { //read data
           //process data here
-          m_dataManager.add(responceChar);
+          m_dataManager.add(responseChar);
           
           m_dataCounter--;
           if (m_dataCounter == 0) {
             Serial.print("\r\n----DATA----");
-            changeWorkMode(WorkMode::dataHead);
+            changeWorkMode(WorkMode::dataNextHead);
           }
+          m_msecTimeWork = millis();
         } else {
-          addToShiftCommandBuffer(responceChar);
+          addToCommandBuffer(responseChar);
           AtResult respondResult = checkResult();
           switch (respondResult) {
           case AtResult::ok_rst:
@@ -101,17 +109,19 @@ public:
             changeWorkMode(WorkMode::dataHead);
             break;
           case AtResult::ok_dataHead:
-            headPos = strstr(m_shiftCommandBuffer, "+IPD,");
+            headPos = strstr(m_commandBuffer, dataHeadSignature);
             if ( headPos != NULL) {
-              dataLen = String(headPos + 5);
+              dataLen = String(headPos + sizeof(dataHeadSignature));
               m_dataCounter = dataLen.toInt();
+#ifdef DEBUG_SERIAL
               Serial.print("\r\n----HEAD----");
               Serial.println(m_dataCounter);
+#endif
               changeWorkMode(WorkMode::data);
             }
             break;
           case AtResult::ok:
-            if (!needNextCommand()) {
+            if (!isLongCommand()) {
               callNext();
             } else {
               changeWorkMode(WorkMode::longCommand);
@@ -123,54 +133,64 @@ public:
           case AtResult::none:
             break;
           default:
-            Serial.println("\r\n----END----");
+#ifdef DEBUG_SERIAL
+            Serial.println("\r\n----UNKNOWN RESULT----");
+#endif
             finishWork(true);
           }
+          checkForNewCommandLine();
         }
       }
     }
     checkForTimeout();
-    checkForDataTimeOut();
   }
   
 protected:
   enum AtResult {none, ok, ok_rst, ok_send, ok_dataHead, error};
-  enum WorkMode {command, longCommand, dataHead, data};
+  enum WorkMode {command, longCommand, dataHead, dataNextHead, data};
 
-  char m_shiftCommandBuffer[CM_SHIFT_COMMAND_BUFFER_SIZE + 1];
+  char m_commandBuffer[CM_COMMAND_BUFFER_SIZE];  //last '\0' for strstr func
+  char * m_commandBufferPos;
+  char const* m_commandBufferLast;
   bool m_finishedWork;
 
-  void addToShiftCommandBuffer(char c) {
-    memcpy(m_shiftCommandBuffer, m_shiftCommandBuffer+1, CM_SHIFT_COMMAND_BUFFER_LAST);
-    m_shiftCommandBuffer[CM_SHIFT_COMMAND_BUFFER_LAST] = c;
+  void addToCommandBuffer(char c) {
+    if (m_commandBufferPos < m_commandBufferLast) {
+      *m_commandBufferPos = c;
+      m_commandBufferPos++;
+      *m_commandBufferPos = '\0';
+    } else {
+      finishWork(true);
+    }
   }
 
   void changeWorkMode(WorkMode workMode) {
     m_workMode = workMode;
-    //clearShiftCommandBuffer
-    memset(m_shiftCommandBuffer, '_', CM_SHIFT_COMMAND_BUFFER_SIZE);
+    m_commandBufferPos = m_commandBuffer;
+    *m_commandBufferPos = '\0';
   }
 
   AtResult checkResult() {
     switch(m_workMode) {
     case WorkMode::dataHead:
-      if (strstr(m_shiftCommandBuffer, ":") != NULL) {
+    case WorkMode::dataNextHead:
+      if (strstr(m_commandBuffer, ":") != NULL) {
         return AtResult::ok_dataHead;
       }
       break;
     case WorkMode::longCommand:
-      if (strstr(m_shiftCommandBuffer, ">") != NULL) {
+      if (strstr(m_commandBuffer, ">") != NULL) {
         return AtResult::ok_send;
       }
-      if (strstr(m_shiftCommandBuffer, "ready\r\n") != NULL) {
+      if (strstr(m_commandBuffer, "ready\r\n") != NULL) {
         return AtResult::ok_rst;
       }
       break;
     default:
-      if (strstr(m_shiftCommandBuffer, "OK\r\n") != NULL) {
+      if (strstr(m_commandBuffer, "OK\r\n") != NULL) {
         return AtResult::ok;
       }
-      if (strstr(m_shiftCommandBuffer, "ERROR\r\n") != NULL) {
+      if (strstr(m_commandBuffer, "ERROR\r\n") != NULL) {
         return AtResult::error;
       }
     }
@@ -178,7 +198,7 @@ protected:
   }
 
   void call() {
-    if (m_numCommandForCall < m_countForCall) {
+    if (m_countForCall > 0) {
       Serial.println("\r\n--------");
       esp8266.write(m_commandArray[m_numCommandForCall]);
       esp8266.write("\r\n");
@@ -191,25 +211,25 @@ protected:
 
   void callNext() {
     m_numCommandForCall++;
+    m_countForCall--;
     m_callRepeatCount = 0;
     call();
   }
 
   void callRepeat() {
     m_callRepeatCount++;
-    if (m_callRepeatCount > 3) {
+    if (m_callRepeatCount > 2) {
+#ifdef DEBUG_SERIAL
       Serial.println("\r\n----END----");
+#endif
       finishWork(true);
     } else {
       call();
     }
   }
 
-  bool needNextCommand() {
-    if (strstr(m_commandArray[m_numCommandForCall], "+RST") != NULL) {
-      return true;
-    }
-    if (strstr(m_commandArray[m_numCommandForCall], "+CIPSEND") != NULL) {
+  bool isLongCommand() {
+    if ((strstr(m_commandArray[m_numCommandForCall], "+CIPSEND") != NULL)) {
       return true;
     }
     return false;
@@ -221,26 +241,35 @@ protected:
       if (millis() < m_msecTimeWork) {
         m_msecTimeWork = millis();
       }
-      if ((millis() - m_msecTimeWork) > CM_TIMEOUT_MSEC) {
-        Serial.println("\r\n----TIMEOUT----");
-        finishWork(true);
-        m_msecTimeWork = millis();
+      if ((m_workMode == WorkMode::dataNextHead) || (m_workMode == WorkMode::data)) {
+        if ((millis() - m_msecTimeWork) > CM_DATA_WAIT_MSEC) {
+#ifdef DEBUG_SERIAL
+          Serial.print("\r\n----DATA-END----");
+          Serial.println(m_dataCounter);
+#endif
+          callNext();
+        }
+      } else {
+        if ((millis() - m_msecTimeWork) > CM_TIMEOUT_MSEC) {
+#ifdef DEBUG_SERIAL
+          Serial.println("\r\n----TIMEOUT----");
+#endif
+          finishWork(true);
+        }
       }
     }
   }
 
-  void checkForDataTimeOut() {
-    if (m_workMode == WorkMode::dataHead) {
-      if ((millis() - m_msecTimeWork) > CM_DATA_WAIT_MSEC) {
-        Serial.println("\r\n----DATA-END----");
-        callNext();
-      }
+  void checkForNewCommandLine() {
+    if (*(m_commandBufferPos - 1) == '\n') {      //new command line
+      m_commandResultFunc(m_numCommandForCall, m_commandArray, m_commandBuffer);
+      changeWorkMode(m_workMode);
     }
   }
 
   void finishWork(bool error) {
     m_finishedWork = true;
-    m_commandsCompleteFunc(m_numCommandForCall, error);
+    m_commandsCompleteFunc(m_numCommandForCall, m_commandArray, error);
   }
   
 private:
@@ -252,42 +281,134 @@ private:
   unsigned long m_msecTimeWork;
   WorkMode m_workMode;
   DataManager m_dataManager;
+  CommandResultFunc m_commandResultFunc;
   CommandsCompleteFunc m_commandsCompleteFunc;
 };
 
-const char* commands[] = {"AT", 
-                          /*"AT+RST", 
-                          "AT+CWMODE_CUR=1", 
-                          "AT+CWJAP_CUR=\"****\",\"****\"", //*/
-                          "AT+CIPSTART=\"TCP\",\"194.28.174.234\",80", 
-                          "AT+CIPSEND=67", //71 - 4
-                          "GET /export/exchange_rate_cash.json HTTP/1.1\r\nHost: bank-ua.com\r\n", 
-                          "AT+CIPCLOSE", 
-                          "AT", 
-                          "AT", 
-                          "AT", 
-                          "AT", 
-                          "AT", 
-                          "AT", 
-                          "AT", 
-                          "AT", 
-                          "AT", 
-                          "AT"};
+//***********************************************************************************************
+//***********************************************************************************************
+//***********************************************************************************************
+
+const char* commandsStart[] = {(char*)4,
+  "AT", 
+  "AT+CWMODE_CUR=1", 
+  "AT+CIPSTA_CUR?", 
+  "AT+CIPSTATUS"
+};
+
+const char* commandsConnectToWifi[] = {(char*)2,
+  "AT+CWJAP_CUR=\"*\",\"*\"",
+  "AT+CIPSTA_CUR?"
+};
+
+const char* commandsCloseTCP[] = {(char*)1,
+  "AT+CIPCLOSE"
+};
+
+const char* commandsGetData[] = {(char*)4,
+  "AT+CIPSTART=\"TCP\",\"194.28.174.234\",80", 
+  "AT+CIPSEND=67", 
+  "GET /export/exchange_rate_cash.json HTTP/1.1\r\nHost: bank-ua.com\r\n", 
+  "AT+CIPCLOSE"
+};
+
+bool isConnectedToWiFi = false;
+bool isConnectedToTCP = false;
+CommandManager cm(&dataCompleteFunc, &commandResultFunc, &commandsCompleteFunc);
+
+#define MAX_FLOAT_STR_LENGTH 12
+
+// "key":"value"
+float getFloatJSONValue(char* json, const char* key) {
+  float ret = 0.0;
+  char* cStart = strstr(json, key);
+  if ( cStart != NULL) {
+    cStart += strlen(key) + sizeof("\":\"");
+    char* cEnd = strchr(cStart, '\"');
+    if ((cEnd != NULL) && ((cEnd - cStart) < MAX_FLOAT_STR_LENGTH)) {
+      *cEnd = '\0';
+      String s(cStart);
+      ret = s.toFloat();
+      *cEnd = '\"';
+    }
+  }
+  return ret;
+}
 
 void dataCompleteFunc(char* dataStr) {
-  Serial.println("\r\n\r\nFIND DATA!!!");
+#ifdef DEBUG_SERIAL
+  Serial.print("\r\nFIND DATA: ");
   Serial.println(dataStr);
+#endif
+  float buy = getFloatJSONValue(dataStr, "rateBuy");
+  float sale = getFloatJSONValue(dataStr, "rateSale");
+#ifdef DEBUG_SERIAL
+  if ((buy > 0) && (sale > 0)) {
+    Serial.print("\r\nFIND : ");
+    Serial.print(sale);
+    Serial.print(" ");
+    Serial.println(buy);
+  }
+#endif
 }
 
-void commandsCompleteFunc(uint8_t commandNum, bool error) {
-  Serial.println("\r\n\r\nEND COMMANDS!!!");
-  Serial.println(commandNum);
-  Serial.println(error?"error":"ok");
+void commandResultFunc(uint8_t commandNum, const char** commandArray, char* commandResponse) {
+#ifdef DEBUG_SERIAL
+  Serial.print("\r\nCOMMAND: ");
+  Serial.print(commandNum);
+  Serial.print(" ");
+  Serial.println(commandArray[commandNum]);
+#endif
+  if (strcmp("AT+CIPSTA_CUR?", commandArray[commandNum]) == 0) {
+    if (strstr(commandResponse, "+CIPSTA_CUR:ip:\"") != NULL) {
+      if (strstr(commandResponse, "\"0.0.0.0\"") == NULL) {
+        isConnectedToWiFi = true;
+#ifdef DEBUG_SERIAL
+        Serial.println("ConnectedToWiFi");
+#endif
+      } else {
+        isConnectedToWiFi = false;
+      }
+    }
+  } else if (strcmp("AT+CIPSTATUS", commandArray[commandNum]) == 0) {
+    if (strstr(commandResponse, "STATUS:3") != NULL) {
+      isConnectedToTCP = true;
+#ifdef DEBUG_SERIAL
+        Serial.println("ConnectedToTCP");
+#endif
+    } else {
+      isConnectedToTCP = false;
+    }
+  }
 }
 
-CommandManager cm(commands, &dataCompleteFunc, &commandsCompleteFunc);
+void commandsCompleteFunc(uint8_t commandNum, const char** commandArray, bool error) {
+#ifdef DEBUG_SERIAL
+  Serial.print("\r\n\r\nEND COMMANDS: ");
+  Serial.print(commandNum);
+  Serial.println(error?" error":" ok");
+#endif
+  if (!error) {
+    if (commandArray == commandsStart || commandArray == commandsConnectToWifi || commandArray == commandsCloseTCP) {
+      if (isConnectedToTCP) {
+        cm.call(commandsCloseTCP);
+      } else {
+        if (isConnectedToWiFi) {
+          cm.call(commandsGetData);
+        } else {
+          cm.call(commandsConnectToWifi);
+        }
+      }
+    }
+  } else {
+    // Restart after error
+    cm.call(commandsStart);
+  }
+}
 
 const char* request = "GET /export/exchange_rate_cash.json HTTP/1.1\r\nHost: bank-ua.com\r\n";
+
+#define SERIAL_BIT_RATE 9600
 
 void setup() {
   // Open serial communications and wait for port to open:
@@ -296,15 +417,17 @@ void setup() {
     ; // wait for serial port to connect. Needed for native USB port only
   }
 
-  Serial.println("Started");
-
   // set the data rate for the SoftwareSerial port
   esp8266.begin(SERIAL_BIT_RATE);
   // TODO: delete temporary command for reset after bad command using.
-  esp8266.write("AT+CIPCLOSE\r\n----------------------------------------------\r\n");
-  cm.start(0,8);
+  //esp8266.write("AT+CIPCLOSE\r\n----------------------------------------------\r\n");
+  cm.call(commandsStart);
 }
 
 void loop() {
   cm.process();
+  if (Serial.available()) {
+      char requestChar = Serial.read();
+      esp8266.write(requestChar);
+  }
 }
